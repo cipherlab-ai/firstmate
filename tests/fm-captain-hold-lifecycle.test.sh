@@ -88,6 +88,39 @@ run_captain() {  # <home> <command args...>
     FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-captain-hold.sh" "$@"
 }
 
+make_released_local_merge_fixture() {  # <name> <id> <mode> [PR]
+  local name=$1 id=$2 mode=$3 pr=${4:-}
+  local home repo wt
+  home=$(make_home "$name")
+  repo="$home/projects/sample-local"
+  wt="$home/projects/$id"
+  fm_git_worktree "$repo" "$wt" "fm/$id"
+  printf 'local delivery\n' > "$wt/local.txt"
+  git -C "$wt" add local.txt
+  git -C "$wt" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'local delivery'
+  tasks_in "$home" add "$id" "Ship the local change" --kind ship \
+    --repo sample --start >/dev/null || fail "could not create the local merge fixture"
+  if [ -n "$pr" ]; then
+    fm_write_meta "$home/state/$id.meta" \
+      "window=firstmate:fm-$id" "endpoint_task_id=$id" "worktree=$wt" \
+      "project=$repo" "harness=codex" "kind=ship" "mode=$mode" \
+      "pr=$pr" "spawn_gen=fixture-$id"
+  else
+    fm_write_meta "$home/state/$id.meta" \
+      "window=firstmate:fm-$id" "endpoint_task_id=$id" "worktree=$wt" \
+      "project=$repo" "harness=codex" "kind=ship" "mode=$mode" \
+      "spawn_gen=fixture-$id"
+  fi
+  run_captain "$home" hold "$id" --reason "captain local merge approval pending" \
+    >/dev/null || fail "could not hold the local merge fixture"
+  printf 'Merge the approved local change.\n' > "$home/merge-answer.txt"
+  run_captain "$home" answer "$id" --release \
+    --decision-file "$home/merge-answer.txt" >/dev/null \
+    || fail "could not release the local merge fixture"
+  printf '%s\n' "$home"
+}
+
 request_reconciles() {  # <home> <source-id> <task-id>...
   local home=$1 source_id=$2 id
   shift 2
@@ -3330,6 +3363,119 @@ test_local_merge_entrypoint_separates_an_unreadable_record_from_an_absent_one() 
   pass "the local merge entrypoint separates an unreadable authority record from an absent one"
 }
 
+test_local_merge_entrypoint_refuses_unsafe_git_states() {
+  local home id repo wt before after rc side_before local_sha
+
+  id=sample-diverged-local-entrypoint
+  home=$(make_released_local_merge_fixture diverged-local-entrypoint "$id" local-only)
+  repo="$home/projects/sample-local"
+  printf 'main-only change\n' > "$repo/main-only.txt"
+  git -C "$repo" add main-only.txt
+  git -C "$repo" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'main-only change'
+  before=$(git -C "$repo" rev-parse main)
+  set +e
+  PATH="$home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-merge-local.sh" "$id" \
+    > "$home/diverged.out" 2> "$home/diverged.err"
+  rc=$?
+  set -e
+  after=$(git -C "$repo" rev-parse main)
+  [ "$rc" -ne 0 ] || fail "the local merge entrypoint accepted a diverged task branch"
+  [ "$after" = "$before" ] || fail "the local merge entrypoint moved main for a diverged task branch"
+  assert_grep "fm/$id is not a fast-forward of main" "$home/diverged.err" \
+    "the diverged local merge refusal did not identify the branches"
+  assert_absent "$home/state/.control-$id.lock" \
+    "the refused diverged local merge left its task control lock held"
+
+  id=sample-dirty-local-entrypoint
+  home=$(make_released_local_merge_fixture dirty-local-entrypoint "$id" local-only)
+  repo="$home/projects/sample-local"
+  wt="$home/projects/$id"
+  printf 'dirty fixture edit\n' >> "$repo/README.md"
+  before=$(git -C "$repo" rev-parse main)
+  set +e
+  PATH="$home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-merge-local.sh" "$id" \
+    > "$home/dirty.out" 2> "$home/dirty.err"
+  rc=$?
+  set -e
+  after=$(git -C "$repo" rev-parse main)
+  [ "$rc" -ne 0 ] || fail "the local merge entrypoint accepted a dirty working tree"
+  [ "$after" = "$before" ] || fail "the local merge entrypoint moved main for a dirty working tree"
+  assert_grep "has a dirty working tree" "$home/dirty.err" \
+    "the dirty local merge refusal did not identify the working tree"
+  assert_grep "dirty fixture edit" "$repo/README.md" \
+    "the dirty local merge refusal lost the uncommitted modification"
+  assert_absent "$home/state/.control-$id.lock" \
+    "the refused dirty local merge left its task control lock held"
+  git -C "$repo" checkout -- README.md
+  local_sha=$(git -C "$wt" rev-parse "fm/$id")
+  PATH="$home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-merge-local.sh" "$id" \
+    > "$home/dirty-positive.out" 2> "$home/dirty-positive.err" \
+    || fail "the local merge entrypoint refused the clean positive control"
+  after=$(git -C "$repo" rev-parse main)
+  [ "$after" = "$local_sha" ] || fail "the clean positive control did not fast-forward main"
+
+  id=sample-off-branch-local-entrypoint
+  home=$(make_released_local_merge_fixture off-branch-local-entrypoint "$id" local-only)
+  repo="$home/projects/sample-local"
+  git -C "$repo" checkout -q -b side
+  before=$(git -C "$repo" rev-parse main)
+  side_before=$(git -C "$repo" rev-parse side)
+  set +e
+  PATH="$home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-merge-local.sh" "$id" \
+    > "$home/off-branch.out" 2> "$home/off-branch.err"
+  rc=$?
+  set -e
+  after=$(git -C "$repo" rev-parse main)
+  [ "$rc" -ne 0 ] || fail "the local merge entrypoint accepted an off-default checkout"
+  [ "$after" = "$before" ] || fail "the local merge entrypoint moved main from an off-default checkout"
+  [ "$(git -C "$repo" rev-parse side)" = "$side_before" ] \
+    || fail "the local merge entrypoint moved side from an off-default checkout"
+  assert_grep "is on 'side', expected default branch 'main'" "$home/off-branch.err" \
+    "the off-default local merge refusal did not identify the checked-out branch"
+  assert_absent "$home/state/.control-$id.lock" \
+    "the refused off-default local merge left its task control lock held"
+  git -C "$repo" checkout -q main
+  local_sha=$(git -C "$home/projects/$id" rev-parse "fm/$id")
+  PATH="$home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-merge-local.sh" "$id" \
+    > "$home/off-branch-positive.out" 2> "$home/off-branch-positive.err" \
+    || fail "the local merge entrypoint refused the on-default positive control"
+  after=$(git -C "$repo" rev-parse main)
+  [ "$after" = "$local_sha" ] || fail "the on-default positive control did not fast-forward main"
+
+  id=sample-wrong-mode-local-entrypoint
+  home=$(make_released_local_merge_fixture wrong-mode-local-entrypoint "$id" no-mistakes \
+    https://github.com/sample/sample/pull/88)
+  repo="$home/projects/sample-local"
+  before=$(git -C "$repo" rev-parse main)
+  set +e
+  PATH="$home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-merge-local.sh" "$id" \
+    > "$home/wrong-mode.out" 2> "$home/wrong-mode.err"
+  rc=$?
+  set -e
+  after=$(git -C "$repo" rev-parse main)
+  [ "$rc" -ne 0 ] || fail "the local merge entrypoint accepted a non-local-only task"
+  [ "$after" = "$before" ] || fail "the local merge entrypoint moved main for a non-local-only task"
+  assert_grep "is mode=no-mistakes, not local-only" "$home/wrong-mode.err" \
+    "the non-local-only merge refusal did not identify its mode"
+  assert_absent "$home/state/.control-$id.lock" \
+    "the refused non-local-only merge left its task control lock held"
+
+  pass "the local merge entrypoint refuses diverged, dirty, off-branch, and non-local-only landings"
+}
+
 test_merge_entrypoints_validate_identity_and_state_before_locking() {
   local home pr_state local_state bad_id rc
   home=$(make_home invalid-merge-entrypoint-inputs)
@@ -3882,6 +4028,7 @@ test_pr_merge_entrypoint_refuses_a_captain_held_task
 test_local_merge_entrypoint_refuses_a_captain_held_task
 test_pr_merge_entrypoint_separates_an_unreadable_record_from_an_absent_one
 test_local_merge_entrypoint_separates_an_unreadable_record_from_an_absent_one
+test_local_merge_entrypoint_refuses_unsafe_git_states
 test_merge_entrypoints_validate_identity_and_state_before_locking
 test_merge_entrypoints_refuse_a_reused_task_incarnation
 test_merge_entrypoints_serialize_forced_teardown_before_task_reads
